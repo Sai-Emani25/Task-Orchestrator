@@ -1,0 +1,73 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: tasks
+    // Fields: userId (string), title (string), time (string), priority (string), status (string), subTasks (list), createdAt (timestamp), updatedAt (timestamp)
+    //
+    // Collection: notes
+    // Fields: userId (string), content (string), createdAt (timestamp)
+    //
+    // Collection: interactions
+    // Fields: userId (string), query (string), priority (string), reasoning (string), response (string), metadata (string), createdAt (timestamp)
+    //
+    // ===============================================================
+
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.userId;
+    }
+
+    function isValidTask(data) {
+      return data.userId == request.auth.uid &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 500 &&
+             data.priority in ['High', 'Medium', 'Low'] &&
+             data.status in ['Pending', 'In Progress', 'Completed'] &&
+             (data.time == null || (data.time is string && data.time.size() < 100)) &&
+             (!('subTasks' in data) || (data.subTasks is list && data.subTasks.size() < 20)) &&
+             (!('dependencies' in data) || (data.dependencies is list && data.dependencies.size() < 10)) &&
+             (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+
+    function isValidNote(data) {
+      return data.userId == request.auth.uid &&
+             data.content is string && data.content.size() > 0 && data.content.size() < 5000;
+    }
+
+    function isValidInteraction(data) {
+      return data.userId == request.auth.uid &&
+             data.query is string && data.query.size() < 2000 &&
+             data.response is string && data.response.size() < 5000;
+    }
+
+    match /tasks/{taskId} {
+      allow read: if isDocOwner();
+      allow create: if isAuthenticated() && isValidTask(request.resource.data);
+      allow update: if isDocOwner() && isValidTask(request.resource.data);
+      allow delete: if isDocOwner();
+    }
+
+    match /notes/{noteId} {
+      allow read: if isDocOwner();
+      allow create: if isAuthenticated() && isValidNote(request.resource.data);
+      allow update: if isDocOwner() && isValidNote(request.resource.data);
+      allow delete: if isDocOwner();
+    }
+
+    match /interactions/{interactionId} {
+      allow read: if isDocOwner();
+      allow create: if isAuthenticated() && isValidInteraction(request.resource.data);
+    }
+  }
+}

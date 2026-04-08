@@ -1,0 +1,5 @@
+{
+  "name": "Hierarchical Task Orchestrator",
+  "description": "A multi-agent system using a Manager-Worker pattern to orchestrate tasks, logistics, and data retrieval.",
+  "requestFramePermissions": []
+}
