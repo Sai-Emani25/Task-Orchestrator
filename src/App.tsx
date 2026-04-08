@@ -1,7 +1,11 @@
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Send, Bot, User, Terminal, Calendar, Database, ChevronRight, Loader2, LogIn, LogOut } from "lucide-react";
+import { Send, Bot, User, Terminal, Calendar, Database, ChevronRight, Loader2, LogIn, LogOut, Share2 } from "lucide-react";
 import { auth, db, googleProvider, signInWithPopup, signOut, onAuthStateChanged, collection, addDoc, query, where, onSnapshot, orderBy, limit, serverTimestamp, User as FirebaseUser } from "./firebase";
+import WorkflowVisualizer from "./components/WorkflowVisualizer";
+import { GoogleGenAI, Type } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 interface Message {
   id: string;
@@ -17,7 +21,7 @@ interface SubTask {
   status: "Pending" | "In Progress" | "Completed";
 }
 
-interface Task {
+export interface Task {
   id: string;
   userId: string;
   title: string;
@@ -49,6 +53,7 @@ export default function App() {
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [showTasksPanel, setShowTasksPanel] = useState(false);
   const [showAgentsPanel, setShowAgentsPanel] = useState(false);
+  const [showWorkflow, setShowWorkflow] = useState(false);
   const [filterPriority, setFilterPriority] = useState<string>("All");
   const [filterStatus, setFilterStatus] = useState<string>("All");
   const [input, setInput] = useState("");
@@ -56,6 +61,40 @@ export default function App() {
   const [isDemo, setIsDemo] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  const calendarTool = {
+    name: "manage_calendar",
+    description: "Create, list, or delete calendar events and tasks.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        action: { type: Type.STRING, enum: ["create", "list", "delete"] },
+        title: { type: Type.STRING },
+        time: { type: Type.STRING, description: "ISO 8601 format" },
+        priority: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
+        dependencies: { 
+          type: Type.ARRAY, 
+          items: { type: Type.STRING },
+          description: "List of task titles or IDs that must be completed before this task."
+        }
+      },
+      required: ["action"]
+    }
+  };
+
+  const notesTool = {
+    name: "manage_notes",
+    description: "Store or retrieve notes from the database.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        action: { type: Type.STRING, enum: ["save", "search"] },
+        content: { type: Type.STRING },
+        query: { type: Type.STRING }
+      },
+      required: ["action"]
+    }
+  };
 
   const formatDate = (timestamp: any) => {
     if (!timestamp) return "N/A";
@@ -155,31 +194,126 @@ export default function App() {
     ));
 
     try {
-      const response = await fetch("/api/execute", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          query: queryText, 
-          priority, 
-          isDemo,
-          userId: user?.uid || "anonymous"
-        }),
-      });
+      let reasoning = "";
+      let toolResults: any[] = [];
+      let finalResponseText = "";
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Failed to execute command");
+      if (isDemo) {
+        // Simulated Demo Logic
+        const lowerQuery = queryText.toLowerCase();
+        if (lowerQuery.includes("calendar") || lowerQuery.includes("meeting") || lowerQuery.includes("schedule")) {
+          reasoning = "The user wants to manage their schedule. I will use the Logistics Agent to create a calendar event.";
+          let deps: string[] = [];
+          if (lowerQuery.includes("after") || lowerQuery.includes("depends on")) {
+            deps = ["Previous Task"];
+          }
+          toolResults.push({ 
+            tool: "Logistics", 
+            result: `Simulated calendar action: create for ${queryText.split(" ").slice(0, 3).join(" ")} (Priority: ${priority})`,
+            args: { action: "create", title: queryText.split(" ").slice(0, 3).join(" "), priority, dependencies: deps }
+          });
+          finalResponseText = `I've successfully scheduled your task with ${priority} priority. The Logistics Agent has confirmed the entry.`;
+        } else if (lowerQuery.includes("note") || lowerQuery.includes("save") || lowerQuery.includes("remember")) {
+          reasoning = "The user wants to store information. I will use the Data Agent to save this note.";
+          toolResults.push({ tool: "Data", result: "Note saved successfully.", args: { action: "save", content: queryText } });
+          finalResponseText = "I've saved that information to your notes database for future retrieval.";
+        } else {
+          reasoning = "I will analyze the query and provide a general response.";
+          finalResponseText = `[DEMO MODE] I received your query: "${queryText}". In a real scenario, I would orchestrate sub-agents to handle this based on your ${priority} priority setting.`;
+        }
+      } else {
+        // 1. Primary Agent (Manager) - Parsing intent and creating plan
+        const taskContext = tasks.map(t => `- ${t.title} (Status: ${t.status}, Priority: ${t.priority}, Deps: ${t.dependencies?.join(", ") || "None"})`).join("\n");
+        
+        const managerResponse = await ai.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: `You are the Manager Agent of a Hierarchical Task Orchestrator. 
+              Your goal is to parse the user query, explain your reasoning (Chain-of-Thought), and decide which sub-agents/tools to call.
+              
+              Task Dependencies & Prioritization:
+              - Users can define that one task must be completed before another.
+              - If a user requests a task that depends on an uncompleted task, flag it as 'Blocked' in your reasoning.
+              - If a High priority task depends on a Medium/Low priority task, suggest elevating the blocker's priority.
+              - Ensure tasks are scheduled in the correct logical order.
+              
+              Current Tasks Context:
+              ${taskContext || "No active tasks."}
+              
+              User Query: "${queryText}"
+              Requested Priority: "${priority}"
+              
+              Available Tools:
+              - Logistics Agent (manage_calendar): For scheduling and dependencies.
+              - Data Agent (manage_notes): For storing information.
+              
+              Respond in a structured way:
+              Reasoning: [Your step-by-step plan. Explain how you are handling dependencies and priorities.]
+              Action: [The tool call if needed, or final answer]` }]
+            }
+          ],
+          config: {
+            tools: [{ functionDeclarations: [calendarTool, notesTool] }],
+          }
+        });
+
+        reasoning = managerResponse.text || "Analyzing request...";
+        const functionCalls = managerResponse.functionCalls;
+
+        if (functionCalls) {
+          for (const call of functionCalls) {
+            if (call.name === "manage_calendar") {
+              const args = call.args as any;
+              // Check for existing blockers in context
+              const blockers = (args.dependencies || []).filter((dep: string) => {
+                const blockerTask = tasks.find(t => t.title.toLowerCase() === dep.toLowerCase());
+                return blockerTask && blockerTask.status !== "Completed";
+              });
+
+              toolResults.push({ 
+                tool: "Logistics", 
+                result: `Simulated calendar action: ${args.action} for ${args.title || 'event'} (Priority: ${args.priority || priority})${blockers.length > 0 ? `. WARNING: Blocked by ${blockers.join(", ")}` : ""}`,
+                args: call.args
+              });
+            } else if (call.name === "manage_notes") {
+              const args = call.args as any;
+              if (args.action === "save") {
+                // We'll handle the actual DB save later in the Firestore block
+                toolResults.push({ tool: "Data", result: "Note prepared for storage.", args: call.args });
+              } else if (args.action === "search") {
+                // For search, we might need a backend call, but let's simulate for now
+                toolResults.push({ tool: "Data", result: "Searching notes database...", args: call.args });
+              }
+            }
+          }
+        }
+
+        // 2. Final Consolidation
+        const finalResponse = await ai.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: `Consolidate the following into a final user-friendly response. 
+              Address any dependency blockers or priority conflicts discovered.
+              
+              User Query: ${queryText}
+              Reasoning: ${reasoning}
+              Tool Results: ${JSON.stringify(toolResults)}` }]
+            }
+          ]
+        });
+        finalResponseText = finalResponse.text || "I've processed your request.";
       }
 
-      const data = await response.json();
-
       // Simulate sub-agent activity based on tool results
-      if (data.toolResults) {
-        for (const res of data.toolResults) {
+      if (toolResults.length > 0) {
+        for (const res of toolResults) {
           setAgents(prev => prev.map(a => 
             a.name === res.tool ? { ...a, status: "Active", lastTask: queryText } : a
           ));
-          // Reset to idle after a delay
           setTimeout(() => {
             setAgents(prev => prev.map(a => 
               a.name === res.tool ? { ...a, status: "Idle" } : a
@@ -191,9 +325,9 @@ export default function App() {
       const assistantMsg: Message = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
-        content: data.response || "I processed your request but couldn't generate a final summary.",
-        reasoning: data.reasoning,
-        toolResults: data.toolResults,
+        content: finalResponseText,
+        reasoning,
+        toolResults,
         priority,
       };
 
@@ -206,15 +340,14 @@ export default function App() {
           userId: user.uid,
           query: queryText,
           priority,
-          reasoning: data.reasoning,
-          response: data.response,
-          metadata: JSON.stringify(data.toolResults),
+          reasoning,
+          response: finalResponseText,
+          metadata: JSON.stringify(toolResults),
           createdAt: serverTimestamp()
         });
 
-        // Also save specific entities if tool results indicate success
-        for (const res of data.toolResults) {
-          if (res.tool === "Logistics") {
+        for (const res of toolResults) {
+          if (res.tool === "Logistics" && res.args?.action === "create") {
             const subTasks: SubTask[] = [
               { title: "Identify stakeholders", status: "Completed" },
               { title: "Check availability", status: "Completed" },
@@ -222,23 +355,20 @@ export default function App() {
               { title: "Send invitations", status: "Pending" }
             ];
             
-            // Extract dependencies from tool result if available (simulated for demo/real)
-            const dependencies = res.args?.dependencies || [];
-
             await addDoc(collection(db, "tasks"), {
               userId: user.uid,
               title: res.args?.title || queryText,
               priority: res.args?.priority || priority,
               status: "In Progress",
               subTasks,
-              dependencies,
+              dependencies: res.args?.dependencies || [],
               createdAt: serverTimestamp(),
               updatedAt: serverTimestamp()
             });
-          } else if (res.tool === "Data") {
+          } else if (res.tool === "Data" && res.args?.action === "save") {
             await addDoc(collection(db, "notes"), {
               userId: user.uid,
-              content: queryText, // Simplified for demo
+              content: res.args.content || queryText,
               createdAt: serverTimestamp()
             });
           }
@@ -361,6 +491,61 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* Workflow Visualization Modal */}
+      <AnimatePresence>
+        {showWorkflow && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-8 bg-black/80 backdrop-blur-md">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="bg-[#0a0a0a] border border-white/10 rounded-3xl w-full max-w-6xl h-full max-h-[80vh] overflow-hidden shadow-2xl flex flex-col"
+            >
+              <div className="p-6 border-b border-white/10 flex items-center justify-between bg-[#0f0f0f]">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 bg-orange-600 rounded-lg flex items-center justify-center">
+                    <Database className="w-5 h-5 text-white" />
+                  </div>
+                  <div>
+                    <h2 className="text-sm font-semibold tracking-tight">Workflow Topology Visualizer</h2>
+                    <p className="text-[10px] text-gray-500 uppercase tracking-widest font-mono">Directed Acyclic Graph (DAG) View</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setShowWorkflow(false)}
+                  className="p-2 hover:bg-white/5 rounded-lg transition-colors text-gray-500 hover:text-white"
+                >
+                  <ChevronRight className="w-5 h-5 rotate-90" />
+                </button>
+              </div>
+              <div className="flex-1 p-6">
+                <WorkflowVisualizer tasks={tasks} onTaskClick={(task) => {
+                  setSelectedTask(task);
+                  setShowWorkflow(false);
+                }} />
+              </div>
+              <div className="p-4 border-t border-white/10 bg-[#0f0f0f] flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-gray-600" />
+                    <span className="text-[9px] text-gray-500 font-mono uppercase">Pending</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-blue-500" />
+                    <span className="text-[9px] text-gray-500 font-mono uppercase">In Progress</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-green-500" />
+                    <span className="text-[9px] text-gray-500 font-mono uppercase">Completed</span>
+                  </div>
+                </div>
+                <p className="text-[9px] text-gray-600 font-mono uppercase">Drag nodes to rearrange • Click nodes for details</p>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Header */}
       <header className="border-b border-white/10 p-4 flex items-center justify-between bg-[#0f0f0f]">
         <div className="flex items-center gap-3">
@@ -404,6 +589,17 @@ export default function App() {
           >
             <Bot className="w-3 h-3" />
             AGENTS
+          </button>
+          <button 
+            onClick={() => setShowWorkflow(!showWorkflow)}
+            className={`flex items-center gap-2 px-2 py-1 rounded border text-[10px] font-mono transition-all ${
+              showWorkflow 
+                ? "bg-orange-500/20 border-orange-500/50 text-orange-400" 
+                : "bg-white/5 border-white/10 text-gray-500 hover:bg-white/10"
+            }`}
+          >
+            <Share2 className="w-3 h-3" />
+            WORKFLOW
           </button>
           {user ? (
             <div className="flex items-center gap-3">
